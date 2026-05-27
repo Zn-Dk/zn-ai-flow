@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // 服务端特有：Node.js 模块系统
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    // 服务端特有：Node.js API 类型
+    "lib": ["esnext"],
+    "types": ["node"],
+    // 服务端需要编译输出
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "./dist"
+  }
+}
