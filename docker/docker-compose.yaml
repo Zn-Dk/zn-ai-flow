@@ -1,0 +1,24 @@
+services:
+  zn-ai-flow-postgresql:
+    image: postgres:17-alpine
+    container_name: zn-ai-flow-postgresql
+    restart: unless-stopped
+    ports:
+      - '5433:5432' # 宿主机 5433 → 容器 5432
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=zn_ai_engine
+    volumes:
+      - ./postgresql_data:/var/lib/postgresql/data
+    # 日志控制，防止磁盘被日志撑满
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '100m'
+        max-file: '3'
+
+networks:
+  default:
+    name: zn-ai-flow-network
+    driver: bridge

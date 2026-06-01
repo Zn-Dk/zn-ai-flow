@@ -1,15 +1,15 @@
-# zn-ai-engine — Agent 开发追踪入口
+# zn-ai-flow — Agent 开发追踪入口
 
 > 本文件是 `_agent_dev/` 的入口索引，保持精简。详细内容见各子文件。
 
 ## 项目概述
 
-| 项目         | 说明                                                  |
-| ------------ | ----------------------------------------------------- |
-| **名称**     | zn-ai-engine                                          |
-| **定位**     | AI 工作流编排平台，个人学习实践项目                   |
-| **参考项目** | `miaoma-aiflow`（完整版）                             |
-| **目录**     | `/data/home/zndkqiu/learn/2026-Job/proj/zn-ai-engine` |
+| 项目         | 说明                                                |
+| ------------ | --------------------------------------------------- |
+| **名称**     | zn-ai-flow                                          |
+| **定位**     | AI 工作流编排平台，个人学习实践项目                 |
+| **参考项目** | `miaoma-aiflow`（完整版）                           |
+| **目录**     | `/data/home/zndkqiu/learn/2026-Job/proj/zn-ai-flow` |
 
 ## 技术栈
 
@@ -26,7 +26,7 @@
 ## 规划目录结构
 
 ```
-zn-ai-engine/
+zn-ai-flow/
 ├── _agent_dev/          # Agent 追踪文件
 ├── apps/
 │   ├── api-server/      # NestJS 后端

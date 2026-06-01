@@ -169,6 +169,8 @@ const apiServerConfig: InfiniteDepthConfigWithExtends = {
     '@typescript-eslint/interface-name-prefix': 'off',
     'no-explicit-any': 'off',
     '@typescript-eslint/no-explicit-any': 'error',
+    '@stylistic/semi': 'off',
+    '@stylistic/object-curly-newline': 'off',
   },
 }
 

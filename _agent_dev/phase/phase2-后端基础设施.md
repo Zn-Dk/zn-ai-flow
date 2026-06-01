@@ -8,16 +8,17 @@
 
 ## 步骤总览
 
-| 步骤 | 任务                                | 依赖 DB | 难度   |
-| ---- | ----------------------------------- | ------- | ------ |
-| 2.1  | 初始化 NestJS 项目                  | ❌      | ⭐     |
-| 2.2  | 全局配置（ConfigModule + 路由前缀） | ❌      | ⭐     |
-| 2.3  | 全局 ValidationPipe                 | ❌      | ⭐⭐   |
-| 2.4  | 全局异常过滤器                      | ❌      | ⭐⭐   |
-| 2.5  | 全局响应拦截器                      | ❌      | ⭐     |
-| 2.6  | Prisma 7 集成（PrismaModule）       | ✅      | ⭐⭐⭐ |
-| 2.7  | 定义数据模型（Schema）              | ✅      | ⭐⭐   |
-| 2.8  | 数据库迁移                          | ✅      | ⭐     |
+| 步骤 | 任务                                   | 依赖 DB | 难度   |
+| ---- | -------------------------------------- | ------- | ------ |
+| 2.1  | 初始化 NestJS 项目                     | ❌      | ⭐     |
+| 2.2  | 全局配置（ConfigModule + 路由前缀）    | ❌      | ⭐     |
+| 2.3  | 全局 ValidationPipe                    | ❌      | ⭐⭐   |
+| 2.4  | 全局异常过滤器                         | ❌      | ⭐⭐   |
+| 2.5  | 全局响应拦截器                         | ❌      | ⭐     |
+| 2.6  | PostgreSQL 数据库初始化（Docker）      | ❌      | ⭐     |
+| 2.7  | Prisma 初始化 + 定义数据模型（Schema） | ✅      | ⭐⭐   |
+| 2.8  | 生成 PrismaClient + 数据库迁移         | ✅      | ⭐     |
+| 2.9  | PrismaModule 集成                      | ✅      | ⭐⭐⭐ |
 
 ---
 
@@ -46,16 +47,16 @@
    pnpm add -D @nestjs/cli @nestjs/schematics @types/express @types/node typescript
    ```
 
-3. **创建文件结构**：
+3. **创建文件结构**（这些文件在 `nest new` 时会自动生成，但 monorepo 下需手动创建）：
 
    ```
    apps/api-server/
    ├── src/
    │   ├── main.ts           # 入口
    │   └── app.module.ts     # 根模块
-   ├── nest-cli.json
+   ├── nest-cli.json         # nest new 自动生成，可参考官方模板
    ├── tsconfig.json         # NestJS 专用（不继承根目录的）
-   ├── tsconfig.build.json
+   ├── tsconfig.build.json   # nest new 自动生成
    └── package.json
    ```
 
@@ -127,6 +128,8 @@ pnpm --filter api-server dev
 
 ### 参考源码
 
+> 💡 本步骤均为 NestJS 标准用法，优先参考 [NestJS 官方文档 - Configuration](https://docs.nestjs.com/techniques/configuration)，源码仅供对照。
+
 - `miaoma-aiflow/apps/api-server/src/main.ts`（第 20-25 行）
 - `miaoma-aiflow/apps/api-server/src/app.module.ts`（ConfigModule 部分）
 
@@ -168,6 +171,10 @@ pnpm --filter api-server dev
   - 两者配合使用：既安全又有明确的错误提示
 - **`transform: true` 的副作用**：会把 query 参数的 string 自动转为 number/boolean，大多数情况下是好事，但要注意 `"0"` 会变成 `0`（falsy → truthy 语义变化）。
 
+### 参考
+
+> 💡 ValidationPipe 是 NestJS 内置功能，配置参数均为标准选项，无需参考 miaoma 源码。直接看 [NestJS 官方文档 - Validation](https://docs.nestjs.com/techniques/validation)。
+
 ### 验证
 
 创建一个测试 DTO + Controller，发送带有多余字段的请求，应该返回 400。
@@ -200,6 +207,7 @@ pnpm --filter api-server dev
 - **`response.headersSent` 检查**：如果你后续实现 SSE 流式响应（工作流执行进度推送），必须加这个判断，否则会报 "Cannot set headers after they are sent"。
 - **错误格式设计**：源码用的是 `{ code: string, message: string }`（不是 `{ code: number }`），`code` 是语义化字符串如 `"UNAUTHORIZED"`、`"VALIDATION_ERROR"`，前端可以据此做 i18n。
 - **开发 vs 生产**：`NODE_ENV === 'development'` 时暴露原始错误信息，生产环境统一返回"服务器内部错误"。
+- **`exception.getResponse()` 类型不安全**：NestJS 内置异常返回 `{ statusCode, message, error }`，自定义异常返回 `{ code, message, details }`。不能直接 `as { code: string }` 断言（会取到 `undefined`）。正确做法：定义 `isCustomResponse` 类型守卫（检查 `'code' in resp`），用 if/else 显式区分两种结构，自定义异常直接取 `code`，内置异常用 `mapStatusToCode(status)` 映射。同时注意 `ValidationPipe` 的 `message` 可能是 `string[]`，需要 `Array.isArray` 判断。
 
 ### 参考源码
 
@@ -246,73 +254,108 @@ pnpm --filter api-server dev
 
 ---
 
-## 2.6 Prisma 7 集成
+## 2.6 PostgreSQL 数据库初始化（Docker）
 
 ### 目标
 
-创建全局 PrismaModule，使用 `@prisma/adapter-pg` 连接 PostgreSQL。
+通过 Docker Compose 启动 PostgreSQL 实例，为后续 Prisma 集成提供数据库环境。
+
+### 关键步骤
+
+1. **创建 `docker/docker-compose.yml`**（项目根目录下）：
+
+   ```yaml
+   services:
+     zn-ai-flow-postgresql:
+       image: postgres:17-alpine
+       container_name: zn-ai-flow-postgresql
+       ports:
+         - '5433:5432' # 宿主机 5433 → 容器 5432
+       environment:
+         - POSTGRES_USER=postgres
+         - POSTGRES_PASSWORD=password
+         - POSTGRES_DB=zn_ai_engine
+       volumes:
+         - ./postgresql_data:/var/lib/postgresql/data
+       # 日志控制，防止磁盘被日志撑满
+       logging:
+         driver: 'json-file'
+         options:
+           max-size: '100m'
+           max-file: '3'
+
+   networks:
+     default:
+       name: zn-ai-flow-network
+       driver: bridge
+   ```
+
+2. **启动数据库**：
+
+   ```bash
+   cd docker
+   docker compose up -d
+   ```
+
+3. **验证连接**：
+   ```bash
+   docker exec -it zn-ai-flow-postgresql psql -U postgres -d zn_ai_engine -c '\conninfo'
+   ```
+
+### ⚠️ 踩坑点
+
+- **端口映射**：宿主机用 `5433` 避免与本地已有 PostgreSQL（默认 5432）冲突。`DATABASE_URL` 中必须写 `5433`。
+- **`POSTGRES_DB`**：首次启动时 Docker 会自动创建该数据库，无需手动 `CREATE DATABASE`。
+- **数据持久化**：`volumes` 挂载到 `./postgresql_data`，容器删除后数据不丢失。记得在 `.gitignore` 中忽略 `docker/postgresql_data/`。
+- **`docker compose` vs `docker-compose`**：Docker Desktop 新版本使用 `docker compose`（无连字符），旧版本用 `docker-compose`。
+
+### 验证
+
+```bash
+# 检查容器运行状态
+docker ps | grep zn-ai-flow-postgresql
+
+# 从宿主机连接测试（需要安装 psql 客户端）
+psql -h localhost -p 5433 -U postgres -d zn_ai_engine
+```
+
+---
+
+## 2.7 Prisma 初始化 + 定义数据模型
+
+### 目标
+
+安装 Prisma 依赖，创建 `schema.prisma` 并定义数据模型。此步骤完成后才能 generate 出 `PrismaClient`。
 
 ### 前置条件
 
-⚠️ **此步骤需要 PostgreSQL 运行**。如果还没配置 Docker Compose，先完成数据库部署。
+⚠️ **此步骤需要 PostgreSQL 运行**（步骤 2.6 已完成）。
 
 ### 关键步骤
 
 1. **安装依赖**：
 
    ```bash
-   pnpm add @prisma/client @prisma/adapter-pg pg prisma
-   pnpm add -D @types/pg
+   pnpm add @prisma/client @prisma/adapter-pg pg
+   pnpm add -D prisma @types/pg
    ```
 
-2. **创建文件结构**：
+2. **执行 `prisma init`（CLI 自动生成，无需参考源码）**：
 
-   ```
-   src/prisma/
-   ├── prisma.module.ts    # @Global() 模块
-   └── prisma.service.ts   # 继承 PrismaClient
+   ```bash
+   pnpm --filter api-server exec prisma init
    ```
 
-3. **PrismaService 核心逻辑**：
-   - 继承 `PrismaClient`
-   - 构造函数中创建 `pg.Pool` → `PrismaPg` adapter → 传入 `super()`
-   - 实现 `OnModuleInit`（连接）和 `OnModuleDestroy`（断开 + pool.end）
+   会自动生成以下文件：
+   - `prisma.config.ts` — Prisma 7 配置文件（指定 schema 路径等），**通常无需修改**
+   - `prisma/schema.prisma` — 空模板（含 generator + datasource 骨架）
+   - `.env` — 含 `DATABASE_URL` 占位符
 
-4. **PrismaModule**：
-   - `@Global()` 装饰器 → 全局可用
-   - `providers: [PrismaService]`
-   - `exports: [PrismaService]`
+3. **修改 `prisma/schema.prisma` 中的 generator 输出路径**：
+   - 将 `output` 改为 `../src/generated/prisma/`（缩短 import 路径）
+   - 确认 `datasource db` 的 provider 为 `postgresql`
 
-5. **在 `app.module.ts` 中 import**：
-   ```ts
-   imports: [ConfigModule.forRoot(...), PrismaModule, ...]
-   ```
-
-### ⚠️ 踩坑点
-
-- **Prisma 7 的 `@prisma/adapter-pg`**：这是 Prisma 7 的新特性（Driver Adapters），不再使用内置的连接池，而是用原生 `pg` 的 Pool。好处是更灵活，坏处是需要手动管理 Pool 生命周期。
-- **`generator client` 的 `output` 路径**：源码输出到 `src/generated/prisma/`，这样 import 路径更短。注意 `.gitignore` 中要忽略 `generated/` 目录（它由 `prisma generate` 自动生成）。
-- **`prisma.config.ts`**：Prisma 7 新增的配置文件，用于指定 schema 路径等。参考源码 `apps/api-server/prisma.config.ts`。
-- **连接字符串中的端口**：Docker Compose 映射的端口（如 5433）和容器内部端口（5432）不同，确保 `DATABASE_URL` 用的是映射端口。
-
-### 参考源码
-
-- `miaoma-aiflow/apps/api-server/src/prisma/prisma.service.ts`（39 行）
-- `miaoma-aiflow/apps/api-server/src/prisma/prisma.module.ts`（17 行）
-
----
-
-## 2.7 定义数据模型
-
-### 目标
-
-在 `prisma/schema.prisma` 中定义 9 个 Model + 关系 + 索引。
-
-### 关键步骤
-
-1. **创建 `apps/api-server/prisma/schema.prisma`**
-
-2. **按依赖顺序定义 Model**：
+4. **按依赖顺序定义 Model**：
 
    ```
    User → App → Workflow
@@ -321,12 +364,14 @@ pnpm --filter api-server dev
                 → WorkflowExecution
    ```
 
-3. **定义枚举**：
+5. **定义枚举**：
    - `ExecutionStatus`：RUNNING / SUCCESS / ERROR
    - `AppType`：WORKFLOW / CHATBOT / AGENT
 
 ### ⚠️ 踩坑点
 
+- **`prisma init` 生成的文件可以直接用**：`prisma.config.ts` 无需手动编写或参考源码，CLI 生成即可。唯一需要改的是 `schema.prisma` 中的 `output` 路径。
+- **`generator client` 的 `output` 路径**：源码输出到 `src/generated/prisma/`，这样 import 路径更短。注意 `.gitignore` 中要忽略 `generated/` 目录（它由 `prisma generate` 自动生成）。
 - **自引用关系（App ↔ PublishedApp）**：`App.activePublishedId` 指向 `PublishedApp.id`，同时 `PublishedApp.appId` 指向 `App.id`。这是**双向关联**，Prisma 需要用 `@relation("RelationName")` 消歧义。
 
   ```prisma
@@ -341,17 +386,27 @@ pnpm --filter api-server dev
 - **`@@map("table_name")`**：Model 名用 PascalCase，表名用 snake_case，通过 `@@map` 映射。
 - **`Json` 类型**：`nodes`、`edges`、`nodeTraces` 等字段用 `Json` 类型存储，灵活但失去了数据库层面的类型校验。
 
+### 哪些需要参考源码？
+
+| 文件                                    | 方式                      | 说明                   |
+| --------------------------------------- | ------------------------- | ---------------------- |
+| `prisma.config.ts`                      | ✅ `prisma init` 自动生成 | 无需参考源码           |
+| `schema.prisma`（generator/datasource） | ✅ `prisma init` 自动生成 | 只需改 output 路径     |
+| `schema.prisma`（Model 定义）           | ⚠️ 需参考源码手写         | 业务逻辑，CLI 生成不了 |
+
 ### 参考源码
 
-- `miaoma-aiflow/apps/api-server/prisma/schema.prisma`（完整 244 行，9 个 Model）
+- `miaoma-aiflow/apps/api-server/prisma/schema.prisma`（完整 244 行，仅 Model 定义部分需参考）
 
 ---
 
-## 2.8 数据库迁移
+## 2.8 生成 PrismaClient + 数据库迁移
 
 ### 目标
 
-执行 `prisma migrate dev` 生成迁移文件并同步数据库。
+执行 `prisma generate` 生成 TypeScript 客户端代码，再执行 `prisma migrate dev` 同步数据库结构。
+
+> ⚠️ **必须先完成步骤 2.7**（有了 schema.prisma 才能 generate）。generate 之后才会产出 `PrismaClient` 类，步骤 2.9 的 `PrismaService extends PrismaClient` 才能正常 import。
 
 ### 关键步骤
 
@@ -363,6 +418,8 @@ pnpm --filter api-server dev
    pnpm --filter api-server exec prisma generate
    ```
 
+   执行后会在 `src/generated/prisma/` 下生成 `PrismaClient` 等类型文件。
+
 3. **执行迁移**：
 
    ```bash
@@ -371,7 +428,7 @@ pnpm --filter api-server dev
 
 4. **验证**：
    ```bash
-   pnpm --filter api-server exec prisma studio
+   pnpm --filter api-server exec prisma studio --browser none
    # 打开 Prisma Studio 查看表结构
    ```
 
@@ -383,6 +440,54 @@ pnpm --filter api-server dev
   - `generate`：根据 schema 生成 TypeScript 客户端代码（到 `src/generated/prisma/`）
   - `migrate dev`：生成 SQL 迁移文件 + 执行迁移 + 自动调用 generate
 - **重置数据库**：开发阶段如果 schema 改动大，可以用 `prisma migrate reset`（会清空数据）。
+- **连接字符串中的端口**：Docker Compose 映射的端口（如 5433）和容器内部端口（5432）不同，确保 `DATABASE_URL` 用的是映射端口。
+- **ESM/CJS 模块格式**：Prisma 7.8+ 会根据 `package.json` 的 `"type"` 字段决定生成 ESM 还是 CJS 代码。NestJS 项目**不要**加 `"type": "module"`，否则生成的纯 ESM 代码与 NestJS 的 CJS 编译产物冲突。如果之前加过又移除了，必须重新 `prisma generate`。
+
+---
+
+## 2.9 PrismaModule 集成
+
+### 目标
+
+创建全局 PrismaModule，使用 `@prisma/adapter-pg` 连接 PostgreSQL。
+
+> ⚠️ **必须先完成步骤 2.8**（`prisma generate` 已执行），否则 `PrismaClient` 类不存在，无法 import。
+
+### 关键步骤
+
+1. **创建文件结构**：
+
+   ```
+   src/common/prisma/
+   ├── prisma.module.ts    # @Global() 模块
+   └── prisma.service.ts   # 继承 PrismaClient
+   ```
+
+2. **PrismaService 核心逻辑**：
+   - 继承 `PrismaClient`（从 `src/generated/prisma/` import）
+   - 构造函数中创建 `pg.Pool` → `PrismaPg` adapter → 传入 `super()`
+   - 实现 `OnModuleInit`（连接）和 `OnModuleDestroy`（断开 + pool.end）
+
+3. **PrismaModule**：
+   - `@Global()` 装饰器 → 全局可用
+   - `providers: [PrismaService]`
+   - `exports: [PrismaService]`
+
+4. **在 `app.module.ts` 中 import**：
+   ```ts
+   imports: [ConfigModule.forRoot(...), PrismaModule, ...]
+   ```
+
+### ⚠️ 踩坑点
+
+- **Prisma 7 的 `@prisma/adapter-pg`**：这是 Prisma 7 的新特性（Driver Adapters），不再使用内置的连接池，而是用原生 `pg` 的 Pool。好处是更灵活，坏处是需要手动管理 Pool 生命周期。
+- **import 路径**：`PrismaClient` 从 `../../generated/prisma` 导入（相对于 `src/common/prisma/prisma.service.ts`），而非 `@prisma/client`。
+- **依赖顺序总结**：schema.prisma → `prisma generate` → PrismaClient 产出 → PrismaService 才能 extends
+
+### 参考源码
+
+- `miaoma-aiflow/apps/api-server/src/prisma/prisma.service.ts`（39 行）
+- `miaoma-aiflow/apps/api-server/src/prisma/prisma.module.ts`（17 行）
 
 ---
 
