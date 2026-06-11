@@ -7,7 +7,7 @@ services:
       - '5433:5432' # 宿主机 5433 → 容器 5432
     environment:
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_PASSWORD=zn_5873
       - POSTGRES_DB=zn_ai_engine
     volumes:
       - ./postgresql_data:/var/lib/postgresql/data

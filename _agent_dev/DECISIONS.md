@@ -112,3 +112,54 @@
   - 每个 Phase 有独立的验证目标，完成感更强
   - Phase 5（知识库）是可选的，独立出来方便灵活跳过
   - PROGRESS.md 追踪简单，一目了然
+
+---
+
+## ADR-008：允许增强，但必须先记录到决策文件
+
+- **状态**：已采纳
+- **背景**：在对齐 `miaoma-aiflow` 学习路径时，允许做工程化增强（例如可观测性、状态管理增强），但如果不留痕会导致后续实现口径不一致
+- **决策**：允许增强；凡是相对参考实现的新增设计，必须先（或同步）记录到 `_agent_dev/DECISIONS.md`，再进入实现
+- **执行约束**：
+  - 增强项需说明：增强点、收益、影响范围、回退策略
+  - 若增强会引入额外类型/流程（如 `NodeStatus`），后续源码必须全链路体现，禁止半落地
+  - 若无法完整落地，应回退为“贴近参考实现”的最小方案
+- **原因**：
+  - 保证学习路径与实现结果可追溯
+  - 避免“文档允许增强、代码却半实现”的漂移
+  - 便于后续 CR 和阶段复盘统一判断标准
+
+---
+
+## ADR-009：ExecutionContext 采用“接口优先 + 默认实现”
+
+- **状态**：已采纳
+- **背景**：Phase 3.4 原文档以 `ExecutionContext` 类作为直接契约，后续在 `VariableResolver`、`NodeExecutor`、`Engine` 示例中也直接依赖具体类。随着上下文能力演进（如替换存储实现、测试替身、跨模块解耦），直接依赖具体类会增加耦合。
+- **决策**：在 `core/context.ts` 中先定义 `IExecutionContext` 作为运行态契约，再提供 `DefaultExecutionContext` 作为默认实现；跨模块类型签名优先依赖 `IExecutionContext`。
+- **执行约束**：
+  - 3.4 章节代码示例采用 `IExecutionContext + DefaultExecutionContext` 形态
+  - 3.5/3.6/3.11 中涉及上下文参数的签名统一使用 `IExecutionContext`
+  - 仅在实例化处使用 `new DefaultExecutionContext(inputs)`，避免对具体实现的扩散依赖
+  - 保留最小实现原则，不引入额外上下文实现类（按需再扩展）
+- **收益**：
+  - 降低模块间耦合，便于后续替换实现
+  - 测试时可直接注入 mock 上下文，减少样板代码
+  - 与“配置类型归 `types`、运行态能力归 `core`”的分层保持一致
+- **回退策略**：若后续阶段未出现多实现或测试替身需求，可回退为单类实现（`ExecutionContext`），并同步更新 Phase 文档签名
+
+---
+
+## ADR-010：Context 命名口径统一为 `I*` 接口 + `ExecutionContext` 实现
+
+- **状态**：已采纳
+- **背景**：在 Phase 3.4 落地后，团队确认保留“接口以 `I` 前缀命名”的风格（如 `IExecutionContext`），同时不再使用 `DefaultExecutionContext` 命名，避免类名冗余。
+- **决策**：`core/context.ts` 采用 `IExecutionContext`（接口） + `ExecutionContext`（实现类）的组合；后续 3.5+ 模块签名继续优先依赖接口类型。
+- **执行约束**：
+  - 新增/修改上下文相关参数时，类型签名统一使用 `IExecutionContext`
+  - 实例化处统一使用 `new ExecutionContext(inputs)`
+  - 文档和示例中若出现 `DefaultExecutionContext`，后续迭代时同步收敛到 `ExecutionContext`
+- **收益**：
+  - 保留接口优先的可替换性
+  - 减少实现类命名噪音，提高可读性
+  - 与当前已实现代码一致，降低迁移成本
+- **回退策略**：若后续证明接口抽象无收益，可退回单类实现；若出现多实现需求，可在不破坏当前命名的前提下新增实现类

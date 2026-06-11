@@ -73,7 +73,7 @@
 
    ```bash
    # 运行时
-   pnpm add @langchain/core @langchain/openai
+   pnpm add @langchain/core @langchain/ollama
 
    # 开发时
    pnpm add -D tsup vitest tsx typescript @types/node
@@ -130,9 +130,19 @@
 2. **核心类型设计**：
 
    ```ts
-   // node.ts — 节点类型枚举
+   // node.ts — 节点类型枚举 + 各节点配置类型
    type NodeType = 'start' | 'llm' | 'http' | 'condition' | 'knowledge' | 'end'
 
+   // 节点执行结果（⚠️ 与 miaoma 的差异：miaoma 将此类型定义在 types/logger.ts，
+   // 但语义上它属于节点执行产物，应定义在 types/node.ts，logger.ts 反向 import 使用）
+   interface NodeExecutionResult {
+     success: boolean
+     outputs: Record<string, unknown>
+     duration: number
+     error?: string
+   }
+
+   // workflow.ts — 工作流结构定义
    // 节点定义（对应前端 React Flow 的 Node 数据）
    interface WorkflowNode {
      id: string
@@ -157,14 +167,6 @@
      edges: WorkflowEdge[]
    }
 
-   // 节点执行结果
-   interface NodeExecutionResult {
-     success: boolean
-     outputs: Record<string, unknown>
-     duration: number
-     error?: string
-   }
-
    // 工作流执行结果
    interface WorkflowExecutionResult {
      success: boolean
@@ -175,17 +177,54 @@
    }
    ```
 
+### 📋 类型分层实施顺序（修订）
+
+为避免 `types/node.ts` 与 `core/context.ts` 相互牵引，按“**配置类型归 `types`，运行态类型归 `core`**”拆分：
+
+| 层级        | 归属文件                 | 内容                                                           | 何时添加            |
+| ----------- | ------------------------ | -------------------------------------------------------------- | ------------------- |
+| **Layer 1** | `types/node.ts`          | `ParamType`、`InputParam`、各 `XxxNodeConfig`（节点配置）      | **3.2（当前步骤）** |
+| **Layer 2** | `types/workflow.ts`      | `WorkflowNode`、`WorkflowEdge`、`WorkflowDefinition`（图结构） | **3.2（当前步骤）** |
+| **Layer 3** | `core/context.ts`        | `ExecutionContext` + 节点运行态状态/输出存储                   | 3.4 执行上下文      |
+| **Layer 4** | `nodes/base-executor.ts` | `BaseNodeExecutor` / `NodeExecutor` 执行契约                   | 3.6 节点执行器      |
+
+**当前步骤（3.2）只需写 Layer 1 + Layer 2 的基础结构**：
+
+```ts
+// node.ts — Phase 3.2 只定义节点配置模型
+export type ParamType = 'string' | 'number' | 'boolean' | 'array' | 'object'
+export interface InputParam { name: string; type: ParamType; ... }
+export interface StartNodeConfig { inputs: InputParam[] }
+export interface LLMNodeConfig {
+  model?: string
+  systemPrompt?: string
+  userPrompt: string
+  temperature?: number
+  numCtx?: number
+}
+export interface HttpNodeConfig { url: string; method: string; ... }
+export interface ConditionNodeConfig { conditions: ConditionBranch[] }
+export interface EndNodeConfig { outputs: OutputVariable[] }
+export interface KnowledgeNodeConfig { datasetIds: string[]; ... }
+```
+
 ### ⚠️ 踩坑点
 
 - **`NodeData` 是联合类型**：每种节点类型有不同的配置结构（如 LLM 节点有 `model`、`prompt`，HTTP 节点有 `url`、`method`）。用 discriminated union 或泛型处理。
 - **与 Prisma 的 `Json` 类型对应**：数据库中 `nodes` 和 `edges` 存为 JSON，取出后需要 `as unknown as WorkflowNode[]` 断言。
 - **前端 React Flow 的 Node 类型**：前端的 `Node<T>` 有额外字段（`selected`、`dragging` 等），后端只需要核心字段。
+- **不要一次性写完 `node.ts`**：miaoma 源码的 `node.ts` 有 231 行，但其中 Layer 2-4 的类型在 3.2 阶段用不到。过早定义会导致编译错误（依赖的类型还不存在）或过度设计。
 
 ### 参考源码
 
-- `miaoma-aiflow/packages/ai-engine/src/types/node.ts`（~120 行）
+- `miaoma-aiflow/packages/ai-engine/src/types/node.ts`（~231 行，分 4 层）
 - `miaoma-aiflow/packages/ai-engine/src/types/workflow.ts`（~40 行）
-- `miaoma-aiflow/packages/ai-engine/src/types/logger.ts`（~80 行）
+- `miaoma-aiflow/packages/ai-engine/src/types/logger.ts`（~138 行）
+
+> ⚠️ **miaoma 版已知设计缺陷（本项目修正）**：
+>
+> - `NodeExecutionResult` 定义在 `types/logger.ts`，但它是节点执行产物，语义上应在 `types/node.ts`，`logger.ts` 从那里 import。
+> - `types/logger.ts` 直接 import `NodeKind`（来自 `workflow.ts`），导致 logger 接口与 workflow 类型产生耦合。本项目保持相同结构，但需知晓这一依赖关系。
 
 ---
 
@@ -242,44 +281,84 @@
 
 ### 目标
 
-管理工作流执行过程中的变量存储和节点状态。
+管理工作流执行过程中的变量存储和节点状态，并为 3.5（变量解析）与 3.6（执行器）提供统一运行态接口。
+
+### 关键设计决策（先回答你的疑问）
+
+- **结论**：`ExecutionContext` 相关类型优先定义在 `src/core/context.ts`（或同目录 `context.types.ts`），**不放在 `types/node.ts`**。
+- **原因**：
+  1. `types/node.ts` 负责“节点配置模型（静态）”，`ExecutionContext` 属于“运行态容器（动态）”；职责不同。
+  2. 放在 `core/` 可避免后续 `nodes/*`、`engine.ts`、`resolver.ts` 对 `types/node.ts` 的反向耦合。
+  3. 当前 `ai-engine` 作为单包开发，暂无跨包复用 `ExecutionContext` 的必要，不必过早抽公共类型。
+
+> 仅当未来出现“多个 package 共享同一执行上下文契约”时，再考虑提取到 `types/`。
 
 ### 关键步骤
 
 1. **创建文件**：`src/core/context.ts`
 
-2. **核心设计**：
+2. **最小实现（本阶段必做）**：
 
    ```ts
-   class ExecutionContext {
-     // 存储每个节点的输出
-     private nodeOutputs: Map<string, Record<string, unknown>>
+   export type NodeStatus = 'pending' | 'running' | 'completed' | 'skipped' | 'failed'
 
-     // 节点执行状态
-     private nodeStatus: Map<string, 'pending' | 'running' | 'completed' | 'skipped'>
+   export interface IExecutionContext {
+     // 输入读取
+     getInputs(): Record<string, unknown>
 
-     // 工作流输入参数（Start 节点透传）
-     private inputs: Record<string, unknown>
-
-     // 设置节点输出
+     // 输出读写
      setNodeOutputs(nodeId: string, outputs: Record<string, unknown>): void
-
-     // 获取节点输出（供下游节点引用）
      getNodeOutputs(nodeId: string): Record<string, unknown> | undefined
-
-     // 标记节点完成
-     markCompleted(nodeId: string): void
-
-     // 获取所有已完成节点的输出（用于变量解析）
      getAllOutputs(): Record<string, Record<string, unknown>>
+
+     // 状态读写
+     setNodeStatus(nodeId: string, status: NodeStatus): void
+     getNodeStatus(nodeId: string): NodeStatus | undefined
+   }
+
+   export class DefaultExecutionContext implements IExecutionContext {
+     // 工作流入口输入（Start 节点读取）
+     private readonly inputs: Record<string, unknown>
+
+     // 每个节点的输出命名空间：nodeId -> outputs
+     private readonly nodeOutputs = new Map<string, Record<string, unknown>>()
+
+     // 每个节点的状态：nodeId -> status
+     private readonly nodeStatus = new Map<string, NodeStatus>()
+
+     constructor(inputs: Record<string, unknown>)
+
+     // 输入读取
+     getInputs(): Record<string, unknown>
+
+     // 输出读写
+     setNodeOutputs(nodeId: string, outputs: Record<string, unknown>): void
+     getNodeOutputs(nodeId: string): Record<string, unknown> | undefined
+     getAllOutputs(): Record<string, Record<string, unknown>>
+
+     // 状态读写
+     setNodeStatus(nodeId: string, status: NodeStatus): void
+     getNodeStatus(nodeId: string): NodeStatus | undefined
    }
    ```
 
+3. **本阶段暂不做（避免过度设计）**：
+   - 历史版本回滚、快照恢复
+   - 复杂并发锁
+   - 细粒度权限控制
+
+### 与后续章节的衔接
+
+- **3.5 VariableResolver**：只依赖 `getNodeOutputs` / `getAllOutputs`，不关心内部存储结构。
+- **3.6 NodeExecutor**：通过 `setNodeOutputs` 回写运行结果。
+- **3.11 Engine**：负责状态流转（`pending -> running -> completed/failed/skipped`）。
+
 ### ⚠️ 踩坑点
 
-- **变量命名空间**：每个节点的输出以 `nodeId` 为命名空间隔离，避免冲突。
-- **执行顺序保证**：由于拓扑排序，当节点 B 执行时，其上游节点 A 一定已完成，`getNodeOutputs('A')` 一定有值。
-- **条件分支跳过**：未被选中分支上的节点标记为 `skipped`，不执行。
+- **变量命名空间**：必须按 `nodeId` 隔离输出，禁止把所有字段打平成一个全局对象。
+- **输入只读原则**：`inputs` 在构造时注入，执行中不允许被节点修改。
+- **分支跳过语义**：未选中分支节点应显式标记为 `skipped`，而不是保持 `pending`。
+- **失败可观测性**：建议保留 `failed` 状态，避免仅靠异常字符串判断节点是否失败。
 
 ### 参考源码
 
@@ -291,46 +370,205 @@
 
 ### 目标
 
-解析节点配置中的变量引用模板 `{{nodeId.fieldName}}`，替换为实际值。
+解析节点配置中的变量引用模板 `{{nodeId.fieldName}}`，替换为实际值；并支持对象/数组中的递归解析，作为所有执行器的统一变量渲染入口。
 
 ### 关键步骤
 
 1. **创建文件**：`src/core/variable-resolver.ts`
 
-2. **核心逻辑**：
+2. **先明确与 miaoma 版的对照关系（避免迁移时迷路）**：
+
+| 能力         | miaoma 版          | 文档版（本项目）                  |
+| ------------ | ------------------ | --------------------------------- |
+| 模板语法     | `${nodeId.var}`    | `{{nodeId.field}}`                |
+| 上下文依赖   | `VariableStore`    | `IExecutionContext`               |
+| 路径深度     | 两级（`node.var`） | 多级（`node.response.data.name`） |
+| 对象递归解析 | 无统一方法         | `resolveObject` 统一处理          |
+| 类型保真     | 大多转 string      | 整体变量引用可返回原始类型        |
+
+3. **核心方法签名（建议）**：
 
    ```ts
-   class VariableResolver {
-     // 解析模板字符串中的变量引用
-     resolve(template: string, context: ExecutionContext): string
+   import type { IExecutionContext } from './context'
 
-     // 解析对象中所有字符串字段的变量引用（递归）
-     resolveObject(
-       obj: Record<string, unknown>,
-       context: ExecutionContext,
-     ): Record<string, unknown>
+   export class VariableResolver {
+     // 解析字符串模板（可返回原始类型）
+     resolve(template: string, context: IExecutionContext): unknown
+
+     // 递归解析对象/数组中的变量引用
+     resolveObject<T>(value: T, context: IExecutionContext): T
    }
    ```
 
-3. **模板语法**：
-   - `{{start.input_name}}` — 引用 Start 节点的输入变量
-   - `{{llm_1.result}}` — 引用 LLM 节点的输出
+4. **模板语法**：
+   - `{{start.input_name}}` — 引用 Start 节点输入
+   - `{{llm_1.result}}` — 引用节点输出
    - `{{http_1.response.data.name}}` — 支持嵌套路径
 
-4. **实现要点**：
-   - 正则匹配 `\{\{(.+?)\}\}`
-   - 按 `.` 分割路径，逐层取值
-   - 未找到的变量保留原始模板（或抛错，取决于策略）
+5. **分步实现（按这个顺序写，最稳）**：
+
+#### Step A：正则与整体匹配
+
+```ts
+const VARIABLE_REGEX = /\{\{\s*(.+?)\s*\}\}/g
+const FULL_VARIABLE_REGEX = /^\{\{\s*(.+?)\s*\}\}$/
+```
+
+- `VARIABLE_REGEX`：用于混合文本替换（如 `"结果：{{llm_1.result}}"`）
+- `FULL_VARIABLE_REGEX`：用于判断“整个字符串就是一个变量”，以便返回 number/boolean/object 原始类型
+
+#### Step B：实现路径取值工具函数
+
+```ts
+private getByPath(obj: unknown, path: string[]): unknown {
+  let current: unknown = obj
+
+  for (const key of path) {
+    if (current === null || current === undefined) {
+      return undefined
+    }
+
+    if (typeof current !== 'object') {
+      return undefined
+    }
+
+    current = (current as Record<string, unknown>)[key]
+  }
+
+  return current
+}
+```
+
+#### Step C：从表达式读取变量值
+
+```ts
+private resolveExpression(expr: string, context: IExecutionContext): unknown {
+  const segments = expr.split('.')
+  if (segments.length < 2) {
+    return undefined
+  }
+
+  const [nodeId, ...fieldPath] = segments
+  const outputs = context.getNodeOutputs(nodeId)
+  if (!outputs) {
+    return undefined
+  }
+
+  return this.getByPath(outputs, fieldPath)
+}
+```
+
+#### Step D：实现 `resolve`（关键行为）
+
+```ts
+resolve(template: string, context: IExecutionContext): unknown {
+  const fullMatch = template.match(FULL_VARIABLE_REGEX)
+
+  // 情况1：整个字符串就是变量引用 -> 返回原始类型
+  if (fullMatch) {
+    const value = this.resolveExpression(fullMatch[1], context)
+    return value === undefined ? template : value
+  }
+
+  // 情况2：混合文本 -> 全部替换为字符串
+  return template.replace(VARIABLE_REGEX, (raw, expr: string) => {
+    const value = this.resolveExpression(expr, context)
+
+    // 未命中变量：保留原模板，便于排查
+    if (value === undefined) {
+      return raw
+    }
+
+    if (typeof value === 'string') {
+      return value
+    }
+
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+      return String(value)
+    }
+
+    // object/array 在混合文本里统一序列化
+    try {
+      return JSON.stringify(value)
+    } catch {
+      return String(value)
+    }
+  })
+}
+```
+
+#### Step E：实现 `resolveObject`（递归，支持对象 + 数组）
+
+```ts
+resolveObject<T>(value: T, context: IExecutionContext): T {
+  if (typeof value === 'string') {
+    return this.resolve(value, context) as T
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(item => this.resolveObject(item, context)) as T
+  }
+
+  if (value && typeof value === 'object') {
+    const result: Record<string, unknown> = {}
+
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      result[k] = this.resolveObject(v, context)
+    }
+
+    return result as T
+  }
+
+  return value
+}
+```
+
+6. **建议最终文件骨架（省略无关行）**：
+
+```ts
+import type { IExecutionContext } from './context'
+
+const VARIABLE_REGEX = /\{\{\s*(.+?)\s*\}\}/g
+const FULL_VARIABLE_REGEX = /^\{\{\s*(.+?)\s*\}\}$/
+
+export class VariableResolver {
+  // ... getByPath
+  // ... resolveExpression
+
+  resolve(template: string, context: IExecutionContext): unknown {
+    // ... 按 Step D 实现
+  }
+
+  resolveObject<T>(value: T, context: IExecutionContext): T {
+    // ... 按 Step E 实现
+  }
+}
+
+export function createVariableResolver(): VariableResolver {
+  return new VariableResolver()
+}
+```
+
+### 输入输出行为（务必对齐）
+
+| 输入模板                                | 上下文值          | 结果                           |
+| --------------------------------------- | ----------------- | ------------------------------ |
+| `"{{start.count}}"`                     | `3`               | `3`（number，不是 `"3"`）      |
+| `"count={{start.count}}"`               | `3`               | `"count=3"`                    |
+| `"{{http_1.response.data}}"`            | `{ name: 'Tom' }` | `{ name: 'Tom' }`              |
+| `"用户: {{http_1.response.data.name}}"` | `"Tom"`           | `"用户: Tom"`                  |
+| `"{{unknown.field}}"`                   | 无                | 原样保留 `"{{unknown.field}}"` |
 
 ### ⚠️ 踩坑点
 
-- **嵌套路径解析**：`{{node.output.nested.field}}` 需要递归取值，注意 `null` / `undefined` 的安全访问。
-- **非字符串字段**：如果模板整体就是一个变量引用（如 `{{start.count}}`），且原始值是 number，应该返回 number 而非 string。只有当模板包含混合文本时才转为 string。
-- **循环引用**：理论上不会出现（拓扑排序保证），但防御性编程可以加检测。
+- **嵌套路径解析**：`{{node.output.nested.field}}` 必须安全访问，遇到 `null/undefined` 直接返回 `undefined`。
+- **类型保真**：仅当“整串即变量引用”时返回原始类型；混合文本必须转字符串。
+- **数组递归**：`resolveObject` 不仅要处理对象，还要处理数组，否则 HTTP body 常见结构会漏替换。
+- **未知变量策略**：本阶段采用“保留原模板”，便于调试；后续若改为抛错，需在执行器层统一处理。
 
 ### 参考源码
 
-- `miaoma-aiflow/packages/ai-engine/src/core/variable-resolver.ts`（~70 行）
+- `miaoma-aiflow/packages/ai-engine/src/core/variable-resolver.ts`（语法与依赖不同，但核心思路可对照）
 
 ---
 
@@ -340,50 +578,140 @@
 
 定义节点执行器的抽象基类和注册中心，支持策略模式扩展。
 
+### 前置依赖：ExecutionLogger 接口
+
+> Logger 的完整实现在 3.12，此处只需知道接口签名即可。
+
+```ts
+// 前置声明（详细实现见 3.12）
+interface ExecutionLogger {
+  info(phase: string, message: string, nodeId?: string, data?: unknown): void
+  warn(phase: string, message: string, nodeId?: string, data?: unknown): void
+  error(phase: string, message: string, nodeId?: string, data?: unknown): void
+  debug(phase: string, message: string, nodeId?: string, data?: unknown): void
+  // miaoma 版还有以下便捷方法，可选实现：
+  nodeStart(nodeId: string, type: NodeType, config: unknown): void
+  nodeEnd(nodeId: string, result: NodeExecutionResult): void
+  variableResolve(template: string, raw: string, resolved: unknown): void
+}
+```
+
 ### 关键步骤
 
 1. **创建文件**：
-   - `src/nodes/base-executor.ts`
-   - `src/nodes/registry.ts`
-   - `src/nodes/index.ts`
+   - `src/node/base-executor.ts`
+   - `src/node/registry.ts`
+   - `src/node/index.ts`
 
-2. **基类设计**：
+2. **执行器契约接口（Interface）**：
 
    ```ts
-   abstract class BaseNodeExecutor {
-     abstract readonly type: NodeType
+   // 所有执行器必须实现的契约
+   interface INodeExecutor<TConfig = Record<string, unknown>> {
+     readonly type: NodeType
 
-     // 执行节点逻辑
-     abstract execute(
-       node: WorkflowNode,
-       context: ExecutionContext,
+     execute(
+       nodeId: string,
+       config: TConfig,
+       context: IExecutionContext,
        logger: ExecutionLogger,
      ): Promise<NodeExecutionResult>
-
-     // 变量解析辅助方法（子类可调用）
-     protected resolveVariables(template: string, context: ExecutionContext): string
    }
    ```
 
-3. **注册表**：
+3. **基类设计（模板方法模式）**：
+
+   ```ts
+   abstract class BaseNodeExecutor<
+     TConfig = Record<string, unknown>,
+   > implements INodeExecutor<TConfig> {
+     abstract readonly type: NodeType
+
+     // ─── 子类实现：只关注业务逻辑 ───
+     protected abstract doExecute(
+       nodeId: string,
+       config: TConfig,
+       context: IExecutionContext,
+       logger: ExecutionLogger,
+     ): Promise<NodeExecutionResult>
+
+     // ─── 基类实现：统一处理计时、状态流转、输出回写、异常兜底 ───
+     async execute(
+       nodeId: string,
+       config: TConfig,
+       context: IExecutionContext,
+       logger: ExecutionLogger,
+     ): Promise<NodeExecutionResult> {
+       const startTime = Date.now()
+
+       try {
+         logger.nodeStart(nodeId, this.type, config)
+
+         const result = await this.doExecute(nodeId, config, context, logger)
+
+         // 成功时回写输出到上下文
+         if (result.success) {
+           context.setNodeOutputs(nodeId, result.outputs)
+         }
+
+         const finalResult = { ...result, duration: Date.now() - startTime }
+         logger.nodeEnd(nodeId, finalResult)
+         return finalResult
+       } catch (error) {
+         const result: NodeExecutionResult = {
+           success: false,
+           outputs: {},
+           error: error instanceof Error ? error.message : String(error),
+           duration: Date.now() - startTime,
+         }
+         logger.nodeEnd(nodeId, result)
+         return result
+       }
+     }
+
+     // ─── 辅助方法：变量解析（子类可调用） ───
+
+     // 基类持有 VariableResolver 实例（构造时注入或直接 new）
+     private readonly resolver = new VariableResolver()
+
+     // 解析单个模板字符串（委托给 VariableResolver.resolve）
+     protected resolveTemplate(template: string, context: IExecutionContext): unknown {
+       return this.resolver.resolve(template, context)
+     }
+
+     // 递归解析整个配置对象（对象/数组/字符串逐层遍历）
+     protected resolveObject<T>(value: T, context: IExecutionContext): T {
+       return this.resolver.resolveObject(value, context)
+     }
+   }
+   ```
+
+   > **模板方法的价值**：基类统一处理计时/状态/异常/回写，子类 `doExecute` 只写业务。
+   > 这意味着 3.7~3.10 的每个执行器都不需要重复写 `try/catch` 和 `context.setNodeOutputs`。
+
+4. **注册表**：
 
    ```ts
    class NodeRegistry {
-     private executors = new Map<NodeType, BaseNodeExecutor>()
+     private executors = new Map<NodeType, INodeExecutor<unknown>>()
 
-     register(executor: BaseNodeExecutor): void
-     get(type: NodeType): BaseNodeExecutor
+     register(executor: INodeExecutor<unknown>): void
+     get(type: NodeType): INodeExecutor<unknown> | undefined
      has(type: NodeType): boolean
    }
    ```
 
-4. **工厂函数**（统一创建并注册所有执行器）：
+   说明：
+   - 显式使用 `INodeExecutor<unknown>` 不再省略泛型参数，避免被默认泛型误导
+   - `NodeRegistry` 的职责只是保存“异构执行器集合”，不负责保留每个节点 `config` 的精确类型
+
+5. **工厂函数**（统一创建并注册所有执行器）：
 
    ```ts
-   function createNodeRegistry(config: EngineConfig): NodeRegistry {
+   function createNodeRegistry(): NodeRegistry {
      const registry = new NodeRegistry()
      registry.register(new StartExecutor())
-     registry.register(new LLMExecutor(config))
+     registry.register(new LLMExecutor())
      registry.register(new HttpExecutor())
      registry.register(new ConditionExecutor())
      registry.register(new EndExecutor())
@@ -391,15 +719,30 @@
    }
    ```
 
+### 与 miaoma 版的对照
+
+| 维度          | miaoma 版                                | 文档版（本项目）                       |
+| ------------- | ---------------------------------------- | -------------------------------------- |
+| 接口          | `NodeExecutor<TConfig>`                  | `INodeExecutor<TConfig>`（I 前缀命名） |
+| 模板方法      | `execute`（基类）+ `doExecute`（子类）   | 相同                                   |
+| 执行器入参    | `(nodeId, config, context, logger)`      | 相同                                   |
+| 变量解析辅助  | `resolveConfigVariables` + `deepResolve` | `resolveTemplate` + `resolveObject`    |
+| 解析委托      | 调用 `context.resolveText`               | 调用 `resolver.resolve/resolveObject`  |
+| validate 方法 | 有（子类可重写）                         | 暂不实现，3.13 校验器统一处理          |
+
 ### ⚠️ 踩坑点
 
 - **策略模式**：新增节点类型只需实现 `BaseNodeExecutor` 并注册，不修改引擎代码。这是面试中可以重点讲的设计模式。
-- **配置注入**：LLM 执行器需要 `ollamaBaseUrl` 等配置，通过构造函数注入。
-- **错误处理**：基类可以提供 `try/catch` 包装，子类只需关注核心逻辑。
+- **节点内聚配置优先**：当前阶段 `LLM` 节点的模型参数直接放在节点配置中，执行器无须依赖全局 `EngineConfig` 注入。
+- **模板方法 vs 直接 override execute**：如果子类直接 override `execute`，每个子类都要自己写计时/状态/异常处理 → 大量重复代码。模板方法是 3.7~3.10 能"只关注业务"的前提。
+- **Logger 前置依赖**：3.6 依赖 Logger 接口类型，但 Logger 的完整实现在 3.12。学习时只需知道接口签名即可，具体实现后补。
+- **3.11 引擎不再重复回写**：因为基类已经在 `execute` 中做了 `context.setNodeOutputs`，引擎主循环不需要再做一次。
+- **变量解析不经过 Context**：基类自己持有 `VariableResolver` 实例，辅助方法接收 `context` 参数只是为了读取节点输出数据（`getNodeOutputs`），不在 `IExecutionContext` 上新增 resolve 方法。这保持了 Context 作为纯状态容器的职责单一。
+- **NodeStatus 不在基类管理**：3.4 定义的 `setNodeStatus` / `getNodeStatus` 由 3.11 引擎主循环负责调用（`pending → running → completed/failed/skipped`）。基类只负责输出回写，不负责状态流转，避免基类与引擎双写状态导致不一致。
 
 ### 参考源码
 
-- `miaoma-aiflow/packages/ai-engine/src/nodes/base-executor.ts`（~80 行）
+- `miaoma-aiflow/packages/ai-engine/src/nodes/base-executor.ts`（~112 行）
 - `miaoma-aiflow/packages/ai-engine/src/nodes/registry.ts`（~40 行）
 
 ---
@@ -438,79 +781,90 @@
 
 ### 目标
 
-调用 LLM 大模型（云端 API），支持 Prompt 模板中的变量引用。
+调用 LLM 大模型，支持 Prompt 模板中的变量引用；当前阶段采用**节点内聚配置**，模型相关参数直接由 `LLMNodeConfig` 提供，不额外引入全局 `EngineConfig.llm`。
 
 ### 关键步骤
 
 1. **创建文件**：`src/nodes/executors/llm-executor.ts`
 
 2. **核心逻辑**：
-   - 从节点配置中获取 `model`、`prompt`（系统提示词）、`userMessage`（用户消息）
-   - 解析 prompt 和 userMessage 中的变量引用
-   - 通过 LangChain 的 `ChatOpenAI`（兼容 OpenAI 接口的云模型）调用
-   - 返回 `{ result: string }` 作为节点输出
+   - 使用 `resolveObject(config, context)` 统一解析节点配置中的模板变量
+   - 从节点配置中读取 `model`、`systemPrompt`、`userPrompt`、`assistantPrompt`
+   - 按顺序组装 LangChain 消息数组（`SystemMessage` / `HumanMessage` / `AIMessage`）
+   - 通过 `ChatOllama` 调用模型
+   - 输出 `{ content, tokens }`
 
 3. **配置结构**：
 
    ```ts
    interface LLMNodeData {
-     model: string // 如 'gpt-4o-mini'、'deepseek-chat'、'qwen-plus'
-     systemPrompt: string // 系统提示词（支持变量）
-     userMessage: string // 用户消息（支持变量）
+     model: string // 当前节点使用的模型名
+     systemPrompt?: string // 系统提示词（支持变量）
+     userPrompt: string // 用户消息（支持变量）
+     assistantPrompt?: string // 历史 assistant 消息（支持变量）
      temperature?: number // 温度参数
+     numCtx?: number // Ollama 上下文窗口大小
+     maxTokens?: number // 预留字段，当前实现暂未使用
    }
    ```
 
-4. **引擎配置**（支持任意 OpenAI 兼容接口）：
+4. **调用示例**：
 
    ```ts
-   interface EngineConfig {
-     llm: {
-       baseUrl: string // 如 'https://api.deepseek.com/v1'
-       apiKey: string // 从环境变量读取
-       defaultModel: string // 默认模型名
-     }
+   import { AIMessage, HumanMessage, SystemMessage } from '@langchain/core/messages'
+   import { ChatOllama } from '@langchain/ollama'
+
+   const resolvedConfig = this.resolveObject(config, context)
+   const messages: Array<SystemMessage | HumanMessage | AIMessage> = []
+
+   if (resolvedConfig.systemPrompt) {
+     messages.push(new SystemMessage({ content: resolvedConfig.systemPrompt }))
    }
-   ```
+   if (resolvedConfig.userPrompt) {
+     messages.push(new HumanMessage({ content: resolvedConfig.userPrompt }))
+   }
+   if (resolvedConfig.assistantPrompt) {
+     messages.push(new AIMessage({ content: resolvedConfig.assistantPrompt }))
+   }
 
-5. **调用示例**：
-
-   ```ts
-   import { ChatOpenAI } from '@langchain/openai'
-
-   const llm = new ChatOpenAI({
-     configuration: { baseURL: this.config.llm.baseUrl },
-     apiKey: this.config.llm.apiKey,
-     modelName: nodeData.model || this.config.llm.defaultModel,
-     temperature: nodeData.temperature ?? 0.7,
+   const llm = new ChatOllama({
+     model: resolvedConfig.model,
+     temperature: resolvedConfig.temperature ?? 0.7,
+     numCtx: resolvedConfig.numCtx ?? 4096,
    })
 
-   const response = await llm.invoke([
-     { role: 'system', content: resolvedSystemPrompt },
-     { role: 'user', content: resolvedUserMessage },
-   ])
+   const rsp = await llm.invoke(messages)
+   const content = rsp.content as string
+   const tokens = estimateTokens(content)
 
-   return { success: true, outputs: { result: response.content } }
+   return {
+     success: true,
+     outputs: {
+       content,
+       tokens,
+     },
+     duration,
+   }
    ```
 
-6. **依赖安装**：
+5. **依赖安装**：
 
    ```bash
-   pnpm add @langchain/openai
-   # 替代原来的 @langchain/ollama
+   pnpm add @langchain/ollama
    ```
 
 ### ⚠️ 踩坑点
 
-- **OpenAI 兼容接口**：DeepSeek、通义千问、Moonshot 等国产模型都提供 OpenAI 兼容的 API，只需修改 `baseUrl` 和 `apiKey`。LangChain 的 `ChatOpenAI` 天然支持。
-- **API Key 安全**：Key 从环境变量读取（`.env` 中配置 `LLM_API_KEY`），不要硬编码。
-- **超时处理**：云模型通常比本地快，但仍需设置超时（建议 30s）。
-- **Token 统计**：LangChain 响应中有 `usage` 字段（`promptTokens` + `completionTokens`），可以提取用于监控。
-- **与 miaoma 的差异**：miaoma 用 `@langchain/ollama`（本地模型），我们用 `@langchain/openai`（云模型）。架构相同，只是 LLM provider 不同。
+- **模板变量解析要覆盖整个配置对象**：相比只解析 `systemPrompt` / `userPrompt`，直接对 `config` 使用 `resolveObject` 更统一，也更适合后续新增字段。
+- **消息顺序有语义**：当前实现按 `system → user → assistant` 组装消息；如果后续调整消息顺序，需要同步评估对模型行为的影响。
+- **`content` 当前按字符串处理**：现在实现里直接将 `rsp.content` 视为字符串；如果后续发现模型返回复杂结构，再单独补充归一化逻辑。
+- **token 统计是估算值**：当前 `tokens` 只是基于字符长度的近似估算，用于日志观测即可，不应当作精确计费依据。
+- **与 miaoma 的关系**：仍然沿用 `@langchain/ollama` 方向，但当前文档优先贴合 zn-ai-flow 自己的节点内聚实现，而不是照搬对方的全局配置假设。
 
 ### 参考源码
 
-- `miaoma-aiflow/packages/ai-engine/src/nodes/executors/llm-executor.ts`（~90 行，改 provider 即可）
+- `miaoma-aiflow/packages/ai-engine/src/nodes/executors/llm-executor.ts`
+- `ai-chat/src/lib/ai/llm.ts`
 
 ---
 
@@ -541,6 +895,75 @@
    - 使用 `fetch` 发送请求
    - 解析响应（JSON 或 text）
    - 输出 `{ status, data, headers }`
+
+### 最小实现清单（基于当前 zn-ai-flow 现状）
+
+> 目标：先完成可运行的 `HTTPExecutor`，不为了对齐 `miaoma` 额外引入超前抽象。
+
+#### HTTPExecutor 最小输入解析
+
+- 解析 `url`
+  - 使用 `resolveTemplate` 处理纯字符串模板
+- 解析 `headers`
+  - 使用 `resolveObject` 递归解析 `KVPair[]`
+  - 仅收集 `key` 非空项
+- 解析 `params`
+  - 使用 `resolveObject` 递归解析 `KVPair[]`
+  - 通过 `URLSearchParams` 挂到 URL
+- 解析 `body` / `formData`
+  - `json`：允许模板解析后得到 `string | object | array`
+  - `x-www-form-urlencoded`：由 `formData` 转 `URLSearchParams`
+  - `form-data`：本阶段先按“简化对象提交”处理，不做真实 multipart
+  - `none`：不传 body
+  - `raw`：直接透传字符串
+  - `binary`：若本阶段不实现，显式抛错或返回明确错误，避免静默降级
+
+#### 请求发送与超时
+
+- 使用原生 `fetch`
+- 通过 `AbortSignal.timeout(timeout ?? 30000)` 或等价方式实现超时
+- `GET` / `DELETE` 默认不传 body
+
+#### 日志与观测性
+
+- 继续沿用通用日志方法即可，不必先补专属 `httpRequest` / `httpResponse` 接口
+- 建议至少记录两类日志：
+  - `http:request`：`method`、`url`、`headers`、`body`
+  - `http:response`：`status`、`headers`、`data`、`duration`
+- 如果后续希望把变量解析过程也纳入日志，给 `resolver.resolve` / `resolveObject` 追加可选 `logger` 参数即可，不必回退到 `context.resolveText` 方案
+
+#### 输出结构建议
+
+```ts
+{
+  success: true,
+  outputs: {
+    data,
+    status,
+    headers,
+    success: response.ok,
+    error: response.ok ? null : `HTTP ${response.status}`,
+  },
+  duration,
+}
+```
+
+#### 错误语义建议
+
+- 网络异常 / 超时：
+  - 节点执行结果仍可返回 `success: true`
+  - 但 `outputs.success = false`
+  - `outputs.error` 写入错误信息
+- 原因：这样后续 `condition` 节点可以直接基于 `status` / `success` / `error` 做分支判断
+- 仅当是“节点配置本身无效”时，再考虑返回 `success: false`
+
+#### 本阶段可后置的内容
+
+- `validate()` / `getOutputSchema()`
+- 真实 multipart `form-data`
+- 更细粒度的请求重试
+- HTTPS 自签名证书兼容
+- 专属 Logger 便捷方法
 
 ### ⚠️ 踩坑点
 
@@ -617,8 +1040,6 @@
 
    ```ts
    class WorkflowEngine {
-     constructor(private config: EngineConfig) {}
-
      async execute(
        workflow: WorkflowDefinition,
        inputs: Record<string, unknown>,
@@ -633,7 +1054,7 @@
        graph.build(workflow.nodes, workflow.edges)
 
        // 3. 创建执行上下文
-       const context = new ExecutionContext(inputs)
+       const context = new DefaultExecutionContext(inputs)
        const logger = new ExecutionLogger()
 
        // 4. 按拓扑序执行
@@ -672,8 +1093,8 @@
 3. **工厂函数**（对外暴露的 API）：
 
    ```ts
-   export function createWorkflowEngine(config: EngineConfig): WorkflowEngine {
-     return new WorkflowEngine(config)
+   export function createWorkflowEngine(): WorkflowEngine {
+     return new WorkflowEngine()
    }
    ```
 
@@ -719,9 +1140,19 @@
    class ExecutionLogger {
      private logs: ExecutionLogEntry[] = []
 
-     info(phase: string, message: string, nodeId?: string): void
-     warn(phase: string, message: string, nodeId?: string): void
-     error(phase: string, message: string, nodeId?: string): void
+     info(phase: LogPhase, message: string, nodeId?: string): void
+     warn(phase: LogPhase, message: string, nodeId?: string): void
+     error(phase: LogPhase, message: string, nodeId?: string): void
+     debug(phase: LogPhase, message: string, nodeId?: string): void
+
+     // 语义化便捷方法（phase 由方法内部确定，调用方无需传入）
+     nodeStart(nodeId: string, type: NodeType, config: unknown): void
+     nodeEnd(nodeId: string, result: NodeExecutionResult): void
+     variableResolve(
+       expression: string,
+       originalValue: string,
+       resolvedValue: unknown,
+     ): void
 
      getLogs(): ExecutionLogEntry[]
    }
@@ -731,6 +1162,7 @@
 
 - **日志与 SSE 回调的关系**：Logger 记录的是持久化日志（存入数据库），SSE 回调是实时推送。两者可以共存。
 - **日志量控制**：verbose 模式下记录所有变量解析过程，生产模式只记录关键节点。
+- **⚠️ miaoma 版已知 bug**：`DefaultExecutionLogger` 中通用的 `debug/info/warn/error` 方法将 `phase` 硬编码为固定值（如 `info` 写死 `'workflow:start'`、`error` 写死 `'workflow:end'`），这是错误的——通用方法可能在任意阶段被调用。本项目修正方式：通用方法的 `phase` 参数由调用方传入，不硬编码。
 
 ### 参考源码
 
@@ -807,17 +1239,17 @@
 3. **运行方式**：
 
    ```bash
-   # 运行示例（需要云模型 API Key 配置在 .env 中）
+   # 运行示例（需要可访问的 Ollama 兼容服务）
    pnpm --filter ai-engine example
 
-   # 运行测试（不需要云模型，mock LLM 调用）
+   # 运行测试（不依赖真实 LLM 服务，mock LLM 调用）
    pnpm --filter ai-engine test
    ```
 
 ### ⚠️ 踩坑点
 
-- **LLM 测试需要 Mock**：单元测试不应依赖外部服务。使用 vitest 的 `vi.mock` 模拟 `ChatOpenAI`。
-- **示例需要真实 API Key**：`pnpm example` 是端到端验证，需要 `.env` 中配置 `LLM_API_KEY` 和 `LLM_BASE_URL`。
+- **LLM 测试需要 Mock**：单元测试不应依赖外部服务。使用 vitest 的 `vi.mock` 模拟 `ChatOllama`。
+- **示例需要可访问的模型服务**：`pnpm example` 是端到端验证，需要配置可访问的 Ollama 兼容地址与默认模型。
 
 ### 参考源码
 
