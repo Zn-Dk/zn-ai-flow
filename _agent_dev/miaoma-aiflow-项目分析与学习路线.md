@@ -206,14 +206,16 @@ User ──1:N──> KnowledgeBase ──1:N──> Document
 
 > ⚠️ **实际实施编号调整**：原文档按 miaoma 完整版规划了 11 个 Phase。实际实施中，我们跳过了用户认证（Phase 3）和部分前端（Phase 4/5），重新组织为以下优先级：
 >
-> | 实施 Phase | 对应原规划   | 内容                                         |
-> | ---------- | ------------ | -------------------------------------------- |
-> | Phase 1    | Phase 1      | 工程化基础 ✅                                |
-> | Phase 2    | Phase 2      | 后端基础设施 ✅                              |
-> | Phase 3    | Phase 6      | AI 工作流引擎（`packages/ai-engine`）        |
-> | Phase 4    | Phase 9      | 业务 API + 鉴权（`apps/api-server/modules`） |
-> | Phase 5    | Phase 8      | 知识库 RAG（可选）                           |
-> | Phase 6+   | Phase 5/7/10 | 前端编辑器 + 监控（后续规划）                |
+> | 实施 Phase | 对应原规划              | 内容                                                            |
+> | ---------- | ----------------------- | --------------------------------------------------------------- |
+> | Phase 1    | Phase 1                 | 工程化基础 ✅                                                    |
+> | Phase 2    | Phase 2                 | 后端基础设施 ✅                                                  |
+> | Phase 3    | Phase 6（暂停于 3.10）  | AI 工作流引擎（`packages/ai-engine`）                            |
+> | Phase 4    | Phase 4 + Phase 9（合并）| PostgreSQL 补强 + 业务 API + 鉴权（`apps/api-server/modules`）  |
+> | Phase 5    | Phase 8                 | 知识库 RAG（可选）                                               |
+> | Phase 6+   | Phase 5/7/10            | 前端编辑器 + 监控（后续规划）                                    |
+>
+> ⚠️ **Phase 4 二次调整（ADR-011 → ADR-012）**：Phase 4 最初严格对应原 Phase 9（业务 API + 鉴权），后因面试 PostgreSQL 证据链需求（ADR-011）重新定向为"PostgreSQL 补强"，编码中发现原 Phase 9 的核心内容（API Key 管理/Guard/外部执行接口）缺失，遂正式合并原 Phase4（应用管理 CRUD）+ 原 Phase9（发布/API Key/Guard/执行接口）为当前 Phase4 范围（ADR-012）。其中外部执行接口（原 9.4）因依赖 Phase 3.11（引擎主循环，当前暂停）先实现为**占位版**——鉴权与执行记录链路完整可验证，但不真正调用引擎；待 Phase 3.11 完成后回补真实执行逻辑。详见 [DECISIONS.md](./DECISIONS.md) ADR-011/ADR-012、[phase/phase4-PostgreSQL补强.md](./phase/phase4-PostgreSQL补强.md)。
 >
 > 以下保留原始完整规划作为参考。
 
@@ -575,7 +577,7 @@ cd packages/ai-engine && pnpm test
 | 1          | 工程化基础      | 1-2 天       | ✅ 已完成     |
 | 2          | 后端基础设施    | 2-3 天       | ✅ 已完成     |
 | 3（原）    | 用户认证        | 1-2 天       | ⏭️ 跳过       |
-| 4（原）    | 应用管理 CRUD   | 2 天         | → Phase 6+    |
+| 4（原）    | 应用管理 CRUD   | 2 天         | → **Phase 4**（合并，ADR-012） |
 | 5（原）    | 工作流编辑器 ⭐ | 3-5 天       | → Phase 6+    |
 | 6（原）    | AI 执行引擎 ⭐  | 3-4 天       | → **Phase 3** |
 | 7（原）    | 测试运行 + 追踪 | 2 天         | → Phase 6+    |

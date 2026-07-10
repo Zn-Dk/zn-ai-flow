@@ -42,3 +42,10 @@ yarn-error.log*
 
 .turbo
 .vitest/
+
+# docker 数据卷 (postgres 容器数据, 属主为容器内 postgres 用户, 当前用户无权读取, 不入版本控制)
+/docker/postgresql_data/
+
+# _agent_dev 会话级文件（Agent 工作记忆，非交付物）
+_agent_dev/progress.md
+_agent_dev/findings.md

@@ -20,7 +20,7 @@
 | 3.7  | Start / End 执行器        | ⭐     | 输入透传 / 输出收集            |
 | 3.8  | LLM 执行器                | ⭐⭐⭐ | Ollama 调用、Prompt 模板渲染   |
 | 3.9  | HTTP 执行器               | ⭐⭐   | fetch 请求、变量替换           |
-| 3.10 | Condition 执行器          | ⭐⭐⭐ | 多条件规则匹配、分支选择       |
+| 3.10 | Intention 执行器（意图识别） | ⭐⭐⭐ | LLM 驱动意图识别、分支选择     |
 | 3.11 | 引擎主循环（Engine）      | ⭐⭐⭐ | 按拓扑序执行、条件分支动态裁剪 |
 | 3.12 | 执行日志（Logger）        | ⭐⭐   | 结构化日志、SSE 回调支持       |
 | 3.13 | 工作流校验器（Validator） | ⭐⭐   | 结构合法性校验                 |
@@ -131,7 +131,9 @@
 
    ```ts
    // node.ts — 节点类型枚举 + 各节点配置类型
-   type NodeType = 'start' | 'llm' | 'http' | 'condition' | 'knowledge' | 'end'
+   type NodeType = 'start' | 'end' | 'llm' | 'http' | 'intent' | 'condition' | 'knowledge'
+  // 'intent' = LLM 驱动意图识别（3.10 实现）
+  // 'condition' = 纯规则条件匹配（后续迭代补充）
 
    // 节点执行结果（⚠️ 与 miaoma 的差异：miaoma 将此类型定义在 types/logger.ts，
    // 但语义上它属于节点执行产物，应定义在 types/node.ts，logger.ts 反向 import 使用）
@@ -203,7 +205,10 @@ export interface LLMNodeConfig {
   numCtx?: number
 }
 export interface HttpNodeConfig { url: string; method: string; ... }
-export interface ConditionNodeConfig { conditions: ConditionBranch[] }
+export interface IntentNodeConfig { model: string; intents: Intent[] }
+export interface Intent { name: string; description?: string; condition?: string }
+// 纯规则条件节点（后续迭代，当前不实现执行器）
+export interface ConditionNodeConfig { conditions: ConditionRule[] }
 export interface EndNodeConfig { outputs: OutputVariable[] }
 export interface KnowledgeNodeConfig { datasetIds: string[]; ... }
 ```
@@ -713,7 +718,7 @@ interface ExecutionLogger {
      registry.register(new StartExecutor())
      registry.register(new LLMExecutor())
      registry.register(new HttpExecutor())
-     registry.register(new ConditionExecutor())
+     registry.register(new IntentionExecutor())
      registry.register(new EndExecutor())
      return registry
    }
@@ -978,51 +983,59 @@ interface ExecutionLogger {
 
 ---
 
-## 3.10 Condition 执行器
+## 3.10 Intention 执行器（意图识别）
 
 ### 目标
 
-根据条件规则选择执行分支。
+基于 LLM 对用户输入进行意图识别，选择执行分支。
+
+> **与纯规则 Condition 的区别**：当前 3.10 实现的是意图识别（LLM 驱动），而非基于 `{{var}} eq value` 的规则条件匹配。真正的 Condition 执行器（`ConditionNodeConfig`，纯规则匹配）作为后续迭代补充，类型已在 `types/node.ts` 中预留 `'condition'`。
 
 ### 关键步骤
 
-1. **创建文件**：`src/nodes/executors/condition-executor.ts`
+1. **创建文件**：`src/nodes/executors/intention-executor.ts`
 
-2. **配置结构**：
+2. **配置结构**（已在 3.2 定义）：
 
    ```ts
-   interface ConditionNodeData {
-     conditions: ConditionRule[]
+   // 意图节点配置
+   interface IntentNodeConfig {
+     model: string
+     intents: Intent[]
    }
 
-   interface ConditionRule {
-     id: string // 对应 edge 的 sourceHandle
-     variable: string // 要判断的变量引用，如 '{{http_1.status}}'
-     operator: 'eq' | 'neq' | 'gt' | 'lt' | 'contains' | 'empty' | 'notEmpty'
-     value?: string // 比较值
+   // 意图定义
+   interface Intent {
+     name: string
+     description?: string
+     condition?: string
    }
    ```
 
-3. **核心逻辑**：
-   - 按顺序遍历条件规则
-   - 解析变量引用，获取实际值
-   - 按 operator 比较
-   - 返回第一个匹配的规则 ID（作为选中的分支）
-   - 如果都不匹配，走 `else` 分支（最后一个）
+3. **核心逻辑**（参考 miaoma `condition-executor.ts`）：
+   - 从上游节点获取输入文本（优先找 `output` 字段，再找字符串类型输出）
+   - 构建意图列表字符串（`1. intentName: description`）
+   - 构建 LLM 系统提示词，要求 LLM 以 JSON 格式返回 `{"intent": "意图名称", "confidence": 0.95}`
+   - 使用 `ChatOllama`（temperature=0）进行意图识别
+   - 解析 LLM 响应，提取 `intent` 和 `confidence`
+   - 如果没有匹配到任何意图，使用第一个意图作为默认（confidence=0.3）
+   - 计算分支ID：`intent-${intentIndex}`
 
 4. **输出**：
-   - `{ selectedBranch: string }` — 选中的分支 ID
-   - 引擎收到后调用 `graphBuilder.selectBranch(nodeId, selectedBranch)`
+   - `{ matchedIntent: string, confidence: number }`
+   - `matchedBranch: string`（如 `intent-0`）— 引擎收到后调用 `graphBuilder.selectBranch(nodeId, matchedBranch)`
 
 ### ⚠️ 踩坑点
 
-- **与 GraphBuilder 的协作**：条件节点执行后，引擎需要调用 `selectBranch` 裁剪未选中的分支，然后重新获取剩余的执行顺序。
-- **类型转换**：比较时需要注意类型（`"200" == 200`？），建议统一转为字符串比较，或提供显式类型转换。
-- **else 分支**：如果所有条件都不匹配，应该有一个默认分支。前端编辑器中通常最后一个条件是 "else"。
+- **与 miaoma 的差异**：miaoma 中类名仍为 `ConditionExecutor`、`type = 'condition'`，但实际实现就是意图识别。本项目将语义与命名对齐，类名为 `IntentionExecutor`、`type = 'intent'`，真正的 `condition` 类型留给纯规则条件节点。
+- **与 GraphBuilder 的协作**：意图节点执行后，引擎需要调用 `selectBranch` 裁剪未选中的分支，然后重新获取剩余的执行顺序。分支ID 格式为 `intent-${index}`，对应 edge 的 `sourceHandle`。
+- **LLM 响应解析**：LLM 可能不返回纯 JSON。需要先用正则提取 `{...}` 子串，再 `JSON.parse`；解析失败时降级为关键词匹配（检查响应内容是否包含意图名称）。
+- **temperature=0**：意图识别需要确定性输出，温度设为 0。
+- **默认意图策略**：如果 LLM 未匹配到任何意图，使用第一个意图作为默认（低 confidence），避免工作流中断。
 
 ### 参考源码
 
-- `miaoma-aiflow/packages/ai-engine/src/nodes/executors/condition-executor.ts`（~160 行）
+- `miaoma-aiflow/packages/ai-engine/src/nodes/executors/condition-executor.ts`（189 行，语义为意图识别）
 
 ---
 
@@ -1072,9 +1085,9 @@ interface ExecutionLogger {
 
          callbacks?.onNodeEnd?.(nodeId, result)
 
-         // 条件节点：裁剪分支，重新计算执行顺序
-         if (node.type === 'condition' && result.outputs.selectedBranch) {
-           graph.selectBranch(nodeId, result.outputs.selectedBranch as string)
+        // 意图节点：裁剪分支，重新计算执行顺序
+        if (node.type === 'intent' && result.outputs.matchedBranch) {
+          graph.selectBranch(nodeId, result.outputs.matchedBranch as string)
            executionOrder = graph.getExecutionOrder()
          }
        }
@@ -1232,7 +1245,7 @@ interface ExecutionLogger {
 
 2. **单元测试**（使用 vitest，仅核心模块）：
    - ✅ `GraphBuilder` 测试：拓扑排序、环检测、分支裁剪（**必写**，纯算法）
-   - ✅ `ConditionExecutor` 测试：各种 operator 的匹配逻辑（**必写**，分支逻辑易出 bug）
+   - ✅ `IntentionExecutor` 测试：意图识别匹配逻辑（**必写**，分支逻辑易出 bug）
    - 🟡 `VariableResolver` 测试：模板解析、嵌套路径（可选）
    - ❌ 其他模块：用示例端到端验证即可，不需要单独写测试
 
@@ -1302,7 +1315,7 @@ packages/ai-engine/
 │   │       ├── end-executor.ts
 │   │       ├── llm-executor.ts
 │   │       ├── http-executor.ts
-│   │       └── condition-executor.ts
+│   │       └── intention-executor.ts
 │   ├── logger/
 │   │   ├── index.ts
 │   │   └── execution-logger.ts
@@ -1315,7 +1328,7 @@ packages/ai-engine/
 │   │       ├── end-validator.ts
 │   │       ├── llm-validator.ts
 │   │       ├── http-validator.ts
-│   │       └── condition-validator.ts
+│   │       └── intention-validator.ts
 │   ├── types/
 │   │   ├── index.ts
 │   │   ├── node.ts

@@ -63,7 +63,7 @@
 - **文件职责**：
   - `CLAUDE.md`：入口索引，精简 < 50 行
 - `DECISIONS.md`：架构/技术决策（本文件）
-  - `PROGRESS.md`：阶段进度 + 待办 + 对话摘要
+  - `PLAN.md`：阶段进度 + 验收标准
   - `NOTES.md`：踩坑记录（积累到 3 条以上再创建）
 
 ---
@@ -111,7 +111,7 @@
   - 每个 Phase 体量均匀（各 3-7 天），与 Phase 1/2 粒度一致
   - 每个 Phase 有独立的验证目标，完成感更强
   - Phase 5（知识库）是可选的，独立出来方便灵活跳过
-  - PROGRESS.md 追踪简单，一目了然
+  - PLAN.md 追踪简单，一目了然
 
 ---
 
@@ -163,3 +163,38 @@
   - 减少实现类命名噪音，提高可读性
   - 与当前已实现代码一致，降低迁移成本
 - **回退策略**：若后续证明接口抽象无收益，可退回单类实现；若出现多实现需求，可在不破坏当前命名的前提下新增实现类
+
+---
+
+## ADR-011：暂停 Phase 3，优先实施 Phase 4 数据库 API
+
+- **状态**：已采纳
+- **背景**：Phase 3 AI Engine 已完成至 3.9（Start/End/LLM/HTTP 执行器），但面试中 PostgreSQL 相关的 claim（seed 流程、CRUD 查询、事务、分页）缺乏可验证的代码证据链。仅靠 `schema.prisma` 的数据模型设计不足以支撑面试深挖。
+- **决策**：暂停 Phase 3（3.10~3.14），优先实施 Phase 4 数据库 API 补强
+- **Phase 4 任务清单**：
+  - P0: seed 脚本（初始化 User/App/Workflow 示例数据）+ App CRUD 模块 + 发布接口（事务）
+  - P1: 执行历史查询接口（分页 + status 筛选 + startedAt 倒序）+ PrismaService 连接池显式配置（connection_limit）
+  - P2: 第二次 migration（演示 schema 演进）
+- **原因**：
+  1. seed/CRUD/事务/分页查询是 PostgreSQL 面试高频考点，需可运行代码作为证据
+  2. Phase 4 的 6 项任务不依赖 AI Engine（Phase 3），可独立实施
+  3. `PostgreSQL-面试准备.md` 已建立 claim → 代码定位的映射，需通过编码落地这些代码位置
+- **影响**：Phase 3 的 3.10（Intention 执行器）~3.14（示例+测试）暂停，Phase 4 完成后回来继续
+- **关联文件**：`PostgreSQL-面试准备.md`（新建）
+
+---
+
+## ADR-012：Phase 4 合并原 Phase4(App CRUD) + 原 Phase9(发布/API Key/Guard/执行占位) 范围
+
+- **状态**：已采纳
+- **背景**：ADR-007 将 Phase4 严格映射为 miaoma 原 Phase9（业务 API + 鉴权）；ADR-011 把 Phase4 重新定向为"PostgreSQL 补强"（面试证据驱动）。实际编写 phase4 文档时发现：4.2 App CRUD 其实属于 miaoma 原 Phase4 内容，而原 Phase9 的核心内容——API Key 管理、API Key Guard、外部执行接口（`POST /v1/apps/run`）——完全缺失，导致"业务 API + 鉴权"里的"鉴权"部分没有落地，Phase 编号与实际内容脱节。
+- **决策**：Phase4 范围正式合并为：**原 Phase4（App CRUD） + 原 Phase9（发布事务 / API Key 管理 / API Key Guard / 外部执行接口）**，不再追求与 miaoma 单一 Phase 编号严格一一对应。
+- **9.4 外部执行接口的处理方式**：真正"执行工作流"依赖 Phase 3.11（引擎主循环），当前该模块暂停中。采用**占位实现**：Guard 正常生效鉴权、`AppExecution` 记录真实创建并写入数据库，但执行结果直接标记为 `ERROR` 并注明"引擎未接入"，不真正调用引擎。等 Phase 3.11 完成后，只需替换中间的执行调用逻辑，Controller / Guard / DTO 均不变。
+- **原因**：
+  1. API Key Guard、发布事务、执行记录都是零前端依赖、零引擎依赖的纯 CRUD/中间件逻辑，符合"PostgreSQL 补强需要独立验证路径"的要求
+  2. 占位式的执行接口既能验证鉴权链路完整性，又不会被 Phase 3.11 未完成阻塞
+  3. 避免"鉴权"这个 claim 长期悬空，是原 Phase4 定位（业务 API + 鉴权）里明确要求的能力
+- **影响**：
+  - `phase/phase4-PostgreSQL补强.md` 新增 4.7（API Key 管理）、4.8（API Key Guard）、4.9（外部执行接口占位版）
+  - `miaoma-aiflow-项目分析与学习路线.md` 两处映射表需同步更新，标注合并范围
+- **关联文件**：`phase/phase4-PostgreSQL补强.md`、`miaoma-aiflow-项目分析与学习路线.md`
